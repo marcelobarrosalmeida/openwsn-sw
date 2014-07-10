@@ -14,6 +14,7 @@ p = os.path.abspath(p)
 sys.path.insert(0,p)
 
 from coap import coap
+from coap import coapDefines as d
 
 class SendCoap(threading.Thread):
     def __init__(self,addr,method,period,win,queue):
@@ -36,14 +37,15 @@ class SendCoap(threading.Thread):
     def exec_request(self):
         self.coap = coap.coap()
         if self.method == 'GET':
-            uri = 'coap://[{0}]//storm/period'.format(self.addr)
+            uri = 'coap://[{0}]/strm/period'.format(self.addr)
             r = self.coap.GET(uri)
             self.per = struct.unpack('>H',r)
             self.update_status("PERIOD",self.per)
         else:
-            uri = 'coap://[{0}]//storm/period={1}'.format(self.addr,self.per)
-            self.coap.PUT(uri)
-        
+            uri = 'coap://[{0}]/strm/period'.format(self.addr)
+            per = struct.pack('>H',self.per)
+            r = self.coap.PUT(uri,paryload=per)
+            
     def run(self):
         self.running = True
         while self.running:
@@ -114,7 +116,7 @@ class UDPStormGUI(object):
         f = Frame(self.master,padx=5,pady=5)
         Label(f,text="coap://[").pack(side=LEFT,expand=NO)
         Entry(f,textvariable=self.ipv6_addr,width=40).pack(side=LEFT,expand=YES,fill=X)
-        Label(f,text="]/storm/period=").pack(side=LEFT,expand=NO)
+        Label(f,text="]/strm/period=").pack(side=LEFT,expand=NO)
         Entry(f,textvariable=self.period,width=10).pack(side=LEFT,expand=NO)
         f.pack(side=TOP,expand=YES,fill=X)
         
