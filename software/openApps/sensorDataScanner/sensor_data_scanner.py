@@ -21,11 +21,34 @@ import random
 from Queue import Queue
 
 class WorkerThread(threading.Thread):
-    RANDOM_MAX_STARTUP_TIME = 5
+    
+    RANDOM_MAX_STARTUP_TIME = 10
+    ID_ST, SCAN_ST = range(0,2)
+    MAX_RETRIES = 5
+    MAX_SCAN_TIMEOUT = 15
+    MIN_SCAN_TIMEOUT = 5
+    MAX_ID_TIMEOUT = 30
+    
     def __init__(self,ip):
+        threading.Thread.__init__(self)
+        self.crit_sec = threading.Lock()
         self.ip = ip
         self.answer = None
-
+        self.coap = None
+        self.running = False
+        self.state = WorkerThread.ID_ST
+        self.retries = 0
+        self.scan_time = WorkerThread.MAX_SCAN_TIMEOUT
+        self.id_time = WorkerThread.MAX_ID_TIMEOUT
+        dispatcher.connect(self.cancel,signal='QUIT',sender=dispatcher.Any)
+        dispatcher.connect(self.cancel,signal='DEL-MOTE',sender=dispatcher.Any)
+        dispatcher.connect(self.set_scan_time,signal='SCAN-TIME',sender=dispatcher.Any)
+        self.create_coap()
+        
+    def create_coap(self):
+        if self.coap:
+            self.coap.close()
+            
         while True:
             try:
                 self.coap = coap.coap(udpPort=self.get_random_port())
@@ -33,22 +56,11 @@ class WorkerThread(threading.Thread):
                 time.sleep(1)
             else:
                 break
-            
-        self.crit_sec = threading.Lock()
-        threading.Thread.__init__(self)
-    
-    def get_ip(self):
-        return self.ip
-    
-    def get_answer(self):
-        with self.crit_sec:
-            v = copy.deepcopy(self.answer)
-        return v
-    
-    def set_answer(self,v):
-        with self.crit_sec:
-            self.answer = copy.deepcopy(v)
 
+    def set_scan_time(self,scan_time):
+        with self.crit_sec:
+            self.scan_time = scan_time
+    
     def wait_startup(self):
         time.sleep(random.random()*WorkerThread.RANDOM_MAX_STARTUP_TIME)
 
@@ -56,213 +68,162 @@ class WorkerThread(threading.Thread):
         return random.randint(49152,65535)
         
     def cancel(self):
-        self.coap.close()
+        with self.crit_sec:
+            print 'Thread cancel',self.ip
+            if self.coap:
+                self.coap.close()
+            self.coap = None
+            self.running = False
 
-class GetValueThread(WorkerThread):
-    def __init__(self,ip):
-        WorkerThread.__init__(self,ip)
-        
-    def run(self):
-        self.wait_startup()
+    def get_uri(self,uri):
         try:
-            uri = 'coap://[{0}]/s'.format(self.ip)
+            print 'Thread',self.ip,uri
             r = self.coap.GET(uri)
             r = ''.join([ chr(c) for c in r ])
             r = json.loads(r)
         except Exception, e:
-            self.set_answer({'ans':None, 'error':True, 'error_msg': repr(e)})
+            ans = {'ans':None,'error':True, 'error_msg': repr(e)}
         else:
-            self.set_answer({'ans':r,'error':False})
+            ans = {'ans':r,'error':False}
+        return ans
+            
+    def do_id(self):
+        uri = 'coap://[{0}]/d'.format(self.ip)
+        #print 'Thread',self.ip,uri
+        return self.get_uri(uri)
 
-class GetIDThread(WorkerThread):
-    def __init__(self,ip):
-        WorkerThread.__init__(self,ip)
-        
+    def do_value(self):
+        uri = 'coap://[{0}]/s'.format(self.ip)
+        #print 'Thread',self.ip,uri
+        return self.get_uri(uri)
+
     def run(self):
         self.wait_startup()
-        try:
-            uri = 'coap://[{0}]/d'.format(self.ip)
-            r = self.coap.GET(uri)
-            r = ''.join([ chr(c) for c in r ])
-            r = json.loads(r)
-        except Exception, e:
-            self.set_answer({'ans':None,'error':True, 'error_msg': repr(e)})
-        else:
-            self.set_answer({'ans':r,'error':False})
+        self.running = True
+        #print 'Thread', self.ip, 'running'
+        while self.running:
+            if self.retries > WorkerThread.MAX_RETRIES:
+                break
+            
+            t1 = time.time()
+            
+            if self.state == WorkerThread.ID_ST:
+                ans = self.do_id()
+            else:
+                ans = self.do_value()
+            #print 'Thread',self.ip,ans
+            if ans['error']:
+                dispatcher.send(signal='MOTE-ERROR',ip=self.ip,error=copy.deepcopy(ans['error_msg']))
+                self.retries = self.retries + 1
+                # try to create a new coap connection at each 2 errors
+                if(self.retries % 2) == 0:
+                    self.create_coap()
+                continue
+            
+            self.retries = 0
+            if self.state == WorkerThread.ID_ST:
+                dispatcher.send(signal='NEW-MOTE-ID',ip=self.ip,mid=copy.deepcopy(ans['ans']))
+                self.state = WorkerThread.SCAN_ST
+            else:
+                dispatcher.send(signal='NEW-MOTE-VALUE',ip=self.ip,value=copy.deepcopy(ans['ans']))
 
+            # sleep the remaining time
+            t2 = time.time() - t1
+            if self.state == WorkerThread.ID_ST:
+                t2 = self.id_time - t2
+            else:
+                t2 = self.scan_time - t2
+
+            #print 'Thread sleep',self.ip,t2
+            if t2 > 0:
+                time.sleep(t2)
+            else:
+                time.sleep(WorkerThread.MIN_SCAN_TIMEOUT)
+
+        #print 'Thread end',self.ip
+        dispatcher.send(signal='DEL-MOTE',ip=self.ip) 
+        self.cancel()
         
-class MainWorkerThread(threading.Thread):
-    ID_ST, SCAN_ST = range(0,2)
-    MAX_RETRIES = 5
-    MAX_SCAN_TIMEOUT = 20
+class ThreadScan(object):
     def __init__(self):
-        threading.Thread.__init__(self)
         self.running = False
         self.crit_sec = threading.Lock()
         self.mote_list = {}
+        self.stats = {}
         dispatcher.connect(self.add_mote,signal='ADD-MOTE',sender=dispatcher.Any)
         dispatcher.connect(self.del_mote,signal='DEL-MOTE',sender=dispatcher.Any)
-        dispatcher.connect(self.quit,signal='QUIT',sender=dispatcher.Any)
+        dispatcher.connect(self.mote_error,signal='MOTE-ERROR',sender=dispatcher.Any)
+        dispatcher.connect(self.new_mote_id,signal='NEW-MOTE-ID',sender=dispatcher.Any)
+        dispatcher.connect(self.new_mote_value,signal='NEW-MOTE-VALUE',sender=dispatcher.Any)
 
     def add_mote(self,ip):
         with self.crit_sec:
-            self.mote_list[ip] = {'STATE': MainWorkerThread.ID_ST, 'RETRIES':0}
+            if not self.mote_list.has_key(ip):
+                self.mote_list[ip] = { 'task':None }
+                self.mote_list[ip]['task'] = WorkerThread(ip)
+                self.mote_list[ip]['task'].start()
 
     def del_mote(self,ip):
         with self.crit_sec:
             if self.mote_list.has_key(ip):
                 del self.mote_list[ip]
 
-    def quit(self):
-        self.running = False
-
-    def get_state_list(self,state):
-        with self.crit_sec:
-            lst = [ ip for ip,val in self.mote_list.iteritems() if val['STATE'] == state ]
-        return lst
-
-    def get_timed_out_list(self):
-        with self.crit_sec:
-            lst = [ ip for ip,val in self.mote_list.iteritems() if val['RETRIES'] >= MainWorkerThread.MAX_RETRIES ]
-        return lst
-    
-    def get_id_list(self):
-        return self.get_state_list(MainWorkerThread.ID_ST)
-
-    def get_scan_list(self):
-        return self.get_state_list(MainWorkerThread.SCAN_ST)
-
-    def set_state(self,ip,v):
-        with self.crit_sec:
-            if self.mote_list.has_key(ip):
-                self.mote_list[ip]['STATE'] = v;
-        
-    def set_retry(self,ip,v):
-        with self.crit_sec:
-            if self.mote_list.has_key(ip):
-                self.mote_list[ip]['RETRIES'] = v;
-
-    def add_retry(self,ip):
-        with self.crit_sec:
-            if self.mote_list.has_key(ip):
-                #print ip, self.mote_list[ip]['RETRIES']
-                self.mote_list[ip]['RETRIES'] = self.mote_list[ip]['RETRIES'] + 1
-
-    def run(self):
-        self.running = True
-        while self.running:
-            if not self.mote_list:
-                time.sleep(1)
-                continue
-            # cleanup list
-            #print 'cleanup list:', self.get_timed_out_list()
-            for ip in self.get_timed_out_list():
-                self.del_mote(ip)
-                dispatcher.send(signal='MOTE-TIMED-OUT',ip=ip)
-            # get ID tasks
-            tasks = []
-            ips = self.get_id_list()
-            #print 'get id list:', self.get_id_list()
-            for ip in ips:
-                t = GetIDThread(ip)
-                t.start()
-                tasks.append(t)
-            # get value tasks
-            ips = self.get_scan_list()
-            #print 'get val list:', self.get_scan_list()
-            for ip in ips:
-                t = GetValueThread(ip)
-                t.start()
-                tasks.append(t)
-            # dispatch threads
-            t2 = t1 = time.time()
-            while (t2-t1) < MainWorkerThread.MAX_SCAN_TIMEOUT:
-                time.sleep(1)
-                not_ready = []
-                ready = []
-                error = []
-                for t in tasks:
-                    a = t.get_answer()
-                    if a == None:
-                        not_ready.append(t)
-                    elif a['error']:
-                        error.append(t)
-                    else:
-                        ready.append(t)
-                if not not_ready:
-                    break
-                t2 = time.time()
-            for ip in ips:
-                t.cancel()
-            # mark timed out motes
-            print 'not ready:', [ t.get_ip() for t in not_ready ]
-            print 'ready:', [ t.get_ip() for t in ready ]
-            print 'error:', [ t.get_ip() for t in error ]
-            for t in error:
-                dispatcher.send(signal='MOTE-ERROR',ip=ip,error=t.get_answer())
-                self.add_retry(t.get_ip())
-            for t in not_ready:
-                self.add_retry(t.get_ip())
-            for t in ready:
-                self.add_retry(t.get_ip())
-            # process motes that are answering
-            for t in ready:
-                ans = t.get_answer()
-                ip = t.get_ip()
-                self.set_retry(ip,0)
-                if isinstance(t,GetIDThread):
-                    self.set_state(ip,MainWorkerThread.SCAN_ST)
-                    dispatcher.send(signal='NEW-MOTE-ID',ip=ip,mid=ans['ans'])
-                else:
-                    dispatcher.send(signal='NEW-MOTE-VALUE',ip=ip,value=ans['ans'])
-                
-        self.running = False
-        
-class SensorScannerGUI(object):
-    def __init__(self, master):
-        self.master = master
-        self.ipv6_addr = StringVar()
-        self.ipv6_addr.set('bbbb::1415:92cc:0:2')
-        self.status = StringVar()
-        self.mote = StringVar()
-        self.status.set('')
-        self.start = False
-        self.msgq = Queue()
-        self.stats = {}
-        self.crit_sec = threading.Lock()
-        self.create_gui()
-        dispatcher.connect(self.mote_timed_out,signal='MOTE-TIMED-OUT',sender=dispatcher.Any)
-        dispatcher.connect(self.mote_error,signal='MOTE-ERROR',sender=dispatcher.Any)
-        dispatcher.connect(self.new_mote_id,signal='NEW-MOTE-ID',sender=dispatcher.Any)
-        dispatcher.connect(self.new_mote_value,signal='NEW-MOTE-VALUE',sender=dispatcher.Any)
-        self.scan = MainWorkerThread()
-        self.scan.start()
-        self.master.mainloop()
-
     def mote_error(self,ip,error):
         with self.crit_sec:
-            if self.stats.has_key[ip]:
+            if self.stats.has_key(ip):
                 self.stats[ip]['errors'] = self.stats[ip]['errors'] + 1
-            self.msgq.put(('LOG','Mote Error {0} {1}'.format(ip,error)))
-            self.master.event_generate('<<ProcessMessage>>', when='tail')
-            
-    def mote_timed_out(self,ip):
-        with self.crit_sec:
-            if self.stats.has_key[ip]:
-                del self.stats[ip]
-            self.msgq.put(('LOG','Mote timed out {0}'.format(ip)))
-            self.master.event_generate('<<ProcessMessage>>', when='tail')
             
     def new_mote_id(self,ip,mid):
         with self.crit_sec:
             self.stats[ip] = { 'scans':0, 'errors':0 }
-            self.msgq.put(('LOG','New Mote ID {0} {1}'.format(ip,mid)))
-            self.master.event_generate('<<ProcessMessage>>', when='tail')
 
     def new_mote_value(self,ip,value):
         with self.crit_sec:
             self.stats[ip]['scans'] = self.stats[ip]['scans'] + 1
-            self.msgq.put(('LOG','Mote value {0} {1}'.format(ip,value)))
+
+    def get_stats_sum(self):
+        keys = self.stats.keys()
+        r = { 'errors':0, 'scans':0 ,'alive':len(keys)}
+        for ip in keys:
+            v = self.stats[ip]
+            r['scans'] = r['scans'] + v['scans']
+            r['errors'] = r['errors'] + v['errors']
+        #print r
+        return r
+    
+class SensorScannerGUI(object):
+    def __init__(self, master):
+        self.master = master
+        self.ipv6_addr = StringVar()
+        self.ipv6_addr.set('bbbb::1415:92cc:0:1')
+        self.status = StringVar()
+        self.mote = StringVar()
+        self.scan_time = IntVar()
+        self.status.set('')
+        #self.start = False
+        self.msgq = Queue()
+        self.scan = ThreadScan()
+        self.crit_sec = threading.Lock()
+        self.create_gui()
+        dispatcher.connect(self.remove_mote_from_list,signal='DEL-MOTE',sender=dispatcher.Any)
+        dispatcher.connect(self.mote_error,signal='MOTE-ERROR',sender=dispatcher.Any)
+        dispatcher.connect(self.new_mote_id,signal='NEW-MOTE-ID',sender=dispatcher.Any)
+        dispatcher.connect(self.new_mote_value,signal='NEW-MOTE-VALUE',sender=dispatcher.Any)
+        self.master.mainloop()
+
+    def mote_error(self,ip,error):
+        with self.crit_sec:
+            self.msgq.put(('LOG','ERR {0} {1}'.format(ip,error)))
+            self.master.event_generate('<<ProcessMessage>>', when='tail')
+            
+    def new_mote_id(self,ip,mid):
+        with self.crit_sec:
+            self.msgq.put(('LOG','ID  {0} {1}'.format(ip,mid)))
+            self.master.event_generate('<<ProcessMessage>>', when='tail')
+
+    def new_mote_value(self,ip,value):
+        with self.crit_sec:
+            self.msgq.put(('LOG','VAL {0} {1}'.format(ip,value)))
             self.master.event_generate('<<ProcessMessage>>', when='tail')
         
     def process_message(self,event):
@@ -271,7 +232,8 @@ class SensorScannerGUI(object):
             m = time.strftime("[%H:%M:%S] ") + m
             self.add_log(m)
         elif t == 'STATUS':
-            self.satus.set(m)
+            self.status.set(m)
+        self.update_status_bar()
         self.master.update_idletasks()
 
     def add_log(self,msg=''):
@@ -281,25 +243,37 @@ class SensorScannerGUI(object):
     def add_mote(self,event=None):
         if self.validate_ipv6():
             ip = self.ipv6_addr.get()
-            dispatcher.send(signal='ADD-MOTE',ip=ip)
-            self.mote_list.insert(END,ip)
-    
+            ips = [ self.mote_list.get(idx) for idx in range(0,self.mote_list.size())]
+            if ip not in ips:
+                dispatcher.send(signal='ADD-MOTE',ip=ip)
+                self.mote_list.insert(END,ip)
+
+    def remove_mote_from_list(self,ip):
+        for idx in range(0,self.mote_list.size()):
+            if self.mote_list.get(idx) == ip:
+                self.mote_list.delete(idx)
+            
     def remove_mote(self,event=None):
         sel = self.mote_list.curselection()
         if sel:
             idx = int(sel[0])
             ip = self.mote_list.get(idx)
-            self.mote_list.delete(idx)
             dispatcher.send(signal='DEL-MOTE',ip=ip)
 
     def start_stop(self,event=None):
-        keys = self.stats.keys()
+        keys = self.scan.stats.keys()
         keys.sort()
         for ip in keys:
-            v = self.stats[ip]
+            v = self.scan.stats[ip]
             self.add_log('Stats for ' + ip)
             self.add_log('    Scans : {0}'.format(v['scans']))
             self.add_log('    Errors: {0}'.format(v['errors']))
+            
+    def update_status_bar(self):
+        r = self.scan.get_stats_sum()
+        m = 'Scan frames {0}, Error frames {1}, Mote alive {2}'.format(r['scans'],r['errors'],r['alive'])
+        self.status.set(m)
+        
         #self.start = not self.start;
         #if self.start:
         #    self.start_stop_bt['text'] = 'Stop'
@@ -328,6 +302,14 @@ class SensorScannerGUI(object):
 
         return True
 
+    def set_scan_time(self,event=None):
+        try:
+            v = self.scan_time.get()
+        except:
+            tkMessageBox.showwarning("Scan Time","Invalid scan time")
+        else:
+            dispatcher.send(signal='SCAN-TIME',scan_time=v)
+            
     def create_gui(self):
         self.master.wm_title("Sensor Data Scanner")
 
@@ -358,6 +340,11 @@ class SensorScannerGUI(object):
         f.pack(side=TOP,fill=X)
 
         f = Frame(self.master,padx=5,pady=5)
+        Label(f,text="Scan time:").pack(side=LEFT,expand=NO)
+        Spinbox(f,values=range(1,121),width=5,textvariable=self.scan_time,command=self.set_scan_time).pack(side=LEFT,expand=NO,fill=X)
+        f.pack(side=TOP,fill=X)
+        
+        f = Frame(self.master,padx=5,pady=5)
         self.log_ybar = Scrollbar(f)
         self.log_ybar.pack(side=RIGHT, fill=Y)
         ft=("courier new", 10, "normal")
@@ -370,6 +357,7 @@ class SensorScannerGUI(object):
         Label(f,textvariable=self.status,anchor=W,relief=SUNKEN).pack(side=TOP,expand=YES,fill=X)
         f.pack(side=LEFT,expand=YES,fill=X)
 
+        self.scan_time.set(30)
         self.master.bind("<Return>", self.add_mote)
         self.master.bind('<<ProcessMessage>>', self.process_message)
 
