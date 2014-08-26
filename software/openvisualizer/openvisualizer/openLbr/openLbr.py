@@ -257,7 +257,7 @@ class OpenLbr(eventBusClient.eventBusClient):
                     newUdp = []
                     newUdp += oldUdp[1:3] # Source Port
                     newUdp += oldUdp[3:5] # Destination Port
-                    length = 8+len(pkt[5:])
+                    length = 8+len(oldUdp[5:])
                     newUdp += [(length & 0xFF00) >> 8] # Length
                     newUdp += [(length & 0x00FF) >> 0]
                     idxCS = len(newUdp) # remember index of checksum

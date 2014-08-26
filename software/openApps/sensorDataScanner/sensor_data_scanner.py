@@ -23,7 +23,7 @@ from Queue import Queue
 class WorkerThread(threading.Thread):
     
     RANDOM_MAX_STARTUP_TIME = 10
-    ID_ST, SCAN_ST = range(0,2)
+    BRD_DESC_STATE, PT_DESC_STATE, SCAN_STATE = range(0,3)
     MAX_RETRIES = 5
     MAX_SCAN_TIMEOUT = 15
     MIN_SCAN_TIMEOUT = 5
@@ -36,7 +36,9 @@ class WorkerThread(threading.Thread):
         self.answer = None
         self.coap = None
         self.running = False
-        self.state = WorkerThread.ID_ST
+        self.state = WorkerThread.BRD_DESC_STATE
+        self.pt_index = 0
+        self.brd_desc = None
         self.retries = 0
         self.scan_time = WorkerThread.MAX_SCAN_TIMEOUT
         self.id_time = WorkerThread.MAX_ID_TIMEOUT
@@ -77,59 +79,97 @@ class WorkerThread(threading.Thread):
 
     def get_uri(self,uri):
         try:
+            d=''
             print 'Thread',self.ip,uri
-            r = self.coap.GET(uri)
-            r = ''.join([ chr(c) for c in r ])
-            r = json.loads(r)
+            dispatcher.send(signal='LOG-MSG-MOTE',ip=self.ip,value=uri)
+            d = self.coap.GET(uri)
+            d = ''.join([ chr(c) for c in d ])
+            r = json.loads(d)
         except Exception, e:
-            ans = {'ans':None,'error':True, 'error_msg': repr(e)}
+            ans = {'ans':None,'error':True, 'error_msg': repr(e), 'data':d}
         else:
             ans = {'ans':r,'error':False}
         return ans
             
-    def do_id(self):
+    def do_brd_desc(self):
         uri = 'coap://[{0}]/d'.format(self.ip)
-        #print 'Thread',self.ip,uri
         return self.get_uri(uri)
 
-    def do_value(self):
-        uri = 'coap://[{0}]/s'.format(self.ip)
+    def do_pt_desc(self,index):
+        uri = 'coap://[{0}]/d/pt/{1}'.format(self.ip,index)
         #print 'Thread',self.ip,uri
+        return self.get_uri(uri)
+    
+    def do_value(self,index=-1):
+        if index >= 0:
+            uri = 'coap://[{0}]/s/{1}'.format(self.ip,index)
+        else:            
+            uri = 'coap://[{0}]/s'.format(self.ip)
         return self.get_uri(uri)
 
     def run(self):
         self.wait_startup()
         self.running = True
+        self.pt_index = 0
+        self.brd_desc = None
+        self.retries = 0
+        self.state = WorkerThread.BRD_DESC_STATE
         #print 'Thread', self.ip, 'running'
         while self.running:
             if self.retries > WorkerThread.MAX_RETRIES:
                 break
             
             t1 = time.time()
-            
-            if self.state == WorkerThread.ID_ST:
-                ans = self.do_id()
+
+            # execute current state
+            if self.state == WorkerThread.BRD_DESC_STATE:
+                ans = self.do_brd_desc()
+            elif self.state == WorkerThread.PT_DESC_STATE:
+                ans = self.do_pt_desc(self.pt_index)
+            elif self.state == WorkerThread.SCAN_STATE:
+                ans = self.do_value(self.pt_index)
             else:
-                ans = self.do_value()
-            #print 'Thread',self.ip,ans
+                break
+            
+            # check errors
             if ans['error']:
-                dispatcher.send(signal='MOTE-ERROR',ip=self.ip,error=copy.deepcopy(ans['error_msg']))
+                dispatcher.send(signal='MOTE-ERROR',ip=self.ip,error=copy.deepcopy(ans['error_msg']+', data:'+ans['data']))
                 self.retries = self.retries + 1
                 # try to create a new coap connection at each 2 errors
                 if(self.retries % 2) == 0:
                     self.create_coap()
                 continue
-            
+
+            # calculate next state
             self.retries = 0
-            if self.state == WorkerThread.ID_ST:
+            if self.state == WorkerThread.BRD_DESC_STATE:
                 dispatcher.send(signal='NEW-MOTE-ID',ip=self.ip,mid=copy.deepcopy(ans['ans']))
-                self.state = WorkerThread.SCAN_ST
-            else:
+                self.brd_desc = ans['ans']
+                # wait a response with valid data
+                if self.brd_desc:
+                    print ans['ans']
+                    if self.brd_desc['npts'] > 0:
+                        self.pt_index = 0
+                        self.state = WorkerThread.PT_DESC_STATE
+                    else:
+                        break
+            elif self.state == WorkerThread.PT_DESC_STATE:
                 dispatcher.send(signal='NEW-MOTE-VALUE',ip=self.ip,value=copy.deepcopy(ans['ans']))
+                self.pt_index += 1
+                if self.pt_index >= self.brd_desc['npts']:
+                    self.state = WorkerThread.SCAN_STATE
+                    self.pt_index = 0
+            elif self.state == WorkerThread.SCAN_STATE:
+                dispatcher.send(signal='NEW-MOTE-VALUE',ip=self.ip,value=copy.deepcopy(ans['ans']))
+                self.pt_index += 1
+                if self.pt_index >= self.brd_desc['npts']:
+                    self.pt_index = 0
+            else:
+                break
 
             # sleep the remaining time
             t2 = time.time() - t1
-            if self.state == WorkerThread.ID_ST:
+            if self.state == WorkerThread.BRD_DESC_STATE:
                 t2 = self.id_time - t2
             else:
                 t2 = self.scan_time - t2
@@ -195,7 +235,7 @@ class SensorScannerGUI(object):
     def __init__(self, master):
         self.master = master
         self.ipv6_addr = StringVar()
-        self.ipv6_addr.set('bbbb::1415:92cc:0:1')
+        self.ipv6_addr.set('bbbb::12:4b00:2f4:afc0')#'bbbb::1415:92cc:0:1')
         self.status = StringVar()
         self.mote = StringVar()
         self.scan_time = IntVar()
@@ -209,6 +249,7 @@ class SensorScannerGUI(object):
         dispatcher.connect(self.mote_error,signal='MOTE-ERROR',sender=dispatcher.Any)
         dispatcher.connect(self.new_mote_id,signal='NEW-MOTE-ID',sender=dispatcher.Any)
         dispatcher.connect(self.new_mote_value,signal='NEW-MOTE-VALUE',sender=dispatcher.Any)
+        dispatcher.connect(self.log_msg_mote,signal='LOG-MSG-MOTE',sender=dispatcher.Any)        
         self.master.mainloop()
 
     def mote_error(self,ip,error):
@@ -219,6 +260,11 @@ class SensorScannerGUI(object):
     def new_mote_id(self,ip,mid):
         with self.crit_sec:
             self.msgq.put(('LOG','ID  {0} {1}'.format(ip,mid)))
+            self.master.event_generate('<<ProcessMessage>>', when='tail')
+
+    def log_msg_mote(self,ip,value):
+        with self.crit_sec:
+            self.msgq.put(('LOG','MSG {0} {1}'.format(ip,value)))
             self.master.event_generate('<<ProcessMessage>>', when='tail')
 
     def new_mote_value(self,ip,value):
