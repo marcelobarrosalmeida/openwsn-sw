@@ -25,9 +25,12 @@ class WorkerThread(threading.Thread):
     RANDOM_MAX_STARTUP_TIME = 10
     BRD_DESC_STATE, PT_DESC_STATE, SCAN_STATE = range(0,3)
     MAX_RETRIES = 5
-    MAX_SCAN_TIMEOUT = 15
-    MIN_SCAN_TIMEOUT = 5
-    MAX_ID_TIMEOUT = 30
+    #MAX_SCAN_TIMEOUT = 15
+    #MIN_SCAN_TIMEOUT = 5
+    #MAX_ID_TIMEOUT = 30
+    MAX_SCAN_TIMEOUT = 2
+    MIN_SCAN_TIMEOUT = 2
+    MAX_ID_TIMEOUT = 2
     
     def __init__(self,ip):
         threading.Thread.__init__(self)
@@ -40,6 +43,7 @@ class WorkerThread(threading.Thread):
         self.pt_index = 0
         self.brd_desc = None
         self.retries = 0
+        self.data = {}
         self.scan_time = WorkerThread.MAX_SCAN_TIMEOUT
         self.id_time = WorkerThread.MAX_ID_TIMEOUT
         dispatcher.connect(self.cancel,signal='QUIT',sender=dispatcher.Any)
@@ -107,6 +111,10 @@ class WorkerThread(threading.Thread):
             uri = 'coap://[{0}]/s'.format(self.ip)
         return self.get_uri(uri)
 
+    def do_write(self,index,value):
+        uri = 'coap://[{0}]/s/{1}/{2}'.format(self.ip,index,value)
+        self.coap.PUT(uri)
+
     def run(self):
         self.wait_startup()
         self.running = True
@@ -147,19 +155,24 @@ class WorkerThread(threading.Thread):
                 self.brd_desc = ans['ans']
                 # wait a response with valid data
                 if self.brd_desc:
-                    print ans['ans']
                     if self.brd_desc['npts'] > 0:
                         self.pt_index = 0
+                        self.data = {}
                         self.state = WorkerThread.PT_DESC_STATE
                     else:
                         break
             elif self.state == WorkerThread.PT_DESC_STATE:
+                self.data[self.pt_index] = {}
+                self.data[self.pt_index]['name'] = ans['ans'][u'n']
+                self.data[self.pt_index]['value'] = None
+                self.data[self.pt_index]['type'] = ans['ans'][u't']
                 dispatcher.send(signal='NEW-MOTE-VALUE',ip=self.ip,value=copy.deepcopy(ans['ans']))
                 self.pt_index += 1
                 if self.pt_index >= self.brd_desc['npts']:
                     self.state = WorkerThread.SCAN_STATE
                     self.pt_index = 0
             elif self.state == WorkerThread.SCAN_STATE:
+                self.data[self.pt_index]['value'] = ans['ans'][u'v']
                 dispatcher.send(signal='NEW-MOTE-VALUE',ip=self.ip,value=copy.deepcopy(ans['ans']))
                 self.pt_index += 1
                 if self.pt_index >= self.brd_desc['npts']:
@@ -167,6 +180,26 @@ class WorkerThread(threading.Thread):
             else:
                 break
 
+            # control loop           
+            try:
+                lum = self.data[0]['value']
+                led = self.data[1]['value']
+            except:
+                print 'not ready'
+                pass
+            else:
+                keys = self.data.keys()
+                keys.sort()
+                for k in keys:
+                    print k, self.data[k]['name'], self.data[k]['value']
+                    
+                if lum >= 90 and led == 0:
+                    print 'turn on'
+                    self.do_write(1,1)
+                elif lum < 90 and  led == 1:
+                    print 'turn off'
+                    self.do_write(1,0)
+            
             # sleep the remaining time
             t2 = time.time() - t1
             if self.state == WorkerThread.BRD_DESC_STATE:
