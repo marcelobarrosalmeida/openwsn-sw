@@ -89,11 +89,13 @@ Ensure that openvisualizer is running.
         uri = 'coap://[{0}]/d'.format(ip)
         data = self.coap_get(uri)
         print 'Board description:\n{0}'.format(self.print_dict(data,1))
-        for index in range(data['npts']):
-            uri = 'coap://[{0}]/d/pt/{1}'.format(ip,index)
-            v = self.coap_get(uri)
-            print 'Point [{0}] description:\n{1}'.format(index,self.print_dict(v,1))
-           
+        if data.has_key('npts'):
+            for index in range(data['npts']):
+                uri = 'coap://[{0}]/d/pt/{1}'.format(ip,index)
+                v = self.coap_get(uri)
+                print 'Point [{0}] description:\n{1}'.format(index,self.print_dict(v,1))
+        else:
+            print 'No points'
     def do_quit(self, arg):
         if self.coap:
             self.coap.close()        
